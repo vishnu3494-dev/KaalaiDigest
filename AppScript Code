@@ -1,0 +1,641 @@
+/**
+ * ZERO-COST DAILY COGNITIVE AI AGENT — Groq Cloud edition
+ *
+ * LLM ............ openai/gpt-oss-120b (fallback: openai/gpt-oss-20b)
+ * Speech-to-text . whisper-large-v3-turbo on Groq (for Telegram voice notes)
+ * News grounding . free Google News / YouTube RSS feeds (the LLM has no web access)
+ * Delivery ....... Telegram bot hosted on Google Apps Script
+ *
+ * Features
+ * 1) 7:30 AM IST  Morning digest + active-recall quiz + mind-body protocol
+ * 2) Every 30 min (10:00 AM - 9:30 PM IST)  15-minute whole-brain break
+ * 3) 10:00 PM IST Journal, speech task, Socratic question, invention masterclass
+ * 4) Two-way chat via webhook: quiz answers, debates, voice-note speech analysis
+ *
+ * ONE-TIME SETUP
+ * 1) Project Settings -> Script Properties -> add:
+ *      GROQ_API_KEY, TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID
+ * 2) Run listGroqModels() to see which model IDs your Groq key can use (fix CONFIG.MODEL if needed),
+ *    then run testSetup() once and approve the permissions.
+ * 3) Deploy -> New deployment -> Web app (Execute as: Me, Who has access: Anyone).
+ *    Add the /exec URL as Script Property WEBAPP_URL, then run setTelegramWebhook().
+ * 4) Run setupDailyTriggers() once.
+ *
+ * NEVER paste keys or tokens into this file.
+ */
+
+const CONFIG = {
+  MODEL: 'openai/gpt-oss-120b',
+  FALLBACK_MODEL: 'openai/gpt-oss-20b',
+  STT_MODEL: 'whisper-large-v3-turbo',
+  GROQ_BASE: 'https://api.groq.com/openai/v1',
+  TIMEZONE: 'Asia/Kolkata',
+  TEMPERATURE: 0.7,
+  MAX_TOKENS: 2048,          // visible answer length; the reasoning buffer below is added on top
+  REASONING_EFFORT: 'low',   // 'low' | 'medium' | 'high' (GPT-OSS only; low = faster, fewer tokens)
+  REASONING_BUFFER: 800,     // extra token headroom: GPT-OSS "thinks" first and that counts toward the limit
+  HEADLINES_PER_TOPIC: 4,
+  PAUSE_MS: 20000,           // pause between consecutive Groq calls (free-tier tokens/min limit)
+  HISTORY_MESSAGES: 6,       // chat memory (kept in cache, expires 6h after last write)
+  HISTORY_CHARS: 5000,       // max chars stored per message
+  HISTORY_TOTAL_CHARS: 14000 // max chars of memory sent with each request
+};
+
+// News topics -> Google News RSS search queries (edit freely)
+const NEWS_TOPICS = [
+  { label: 'BENGALURU', query: 'Bengaluru' },
+  { label: 'CHENNAI', query: 'Chennai' },
+  { label: 'KERALA', query: 'Kerala' },
+  { label: 'INDIA', query: 'India' },
+  { label: 'WORLD', query: 'world news' },
+  { label: 'SPORTS', query: 'sports' },
+  { label: 'SCIENCE', query: 'science discovery' },
+  { label: 'HEALTH', query: 'health research' },
+  { label: 'MOTIVATION', query: 'motivation OR habits OR productivity' },
+  { label: 'PSYCHOLOGY & MINDFULNESS', query: 'psychology OR mindfulness OR neuroscience' },
+  { label: 'TECH', query: 'technology' },
+  { label: 'AI', query: 'artificial intelligence' },
+  { label: 'VOICES: AI & TECH', query: '"Demis Hassabis" OR "Andrej Karpathy" OR "Fei-Fei Li" OR "Yann LeCun" OR "Sam Altman"' },
+  { label: 'VOICES: HEALTH & PSYCHOLOGY', query: '"Andrew Huberman" OR "Adam Grant" OR "Angela Duckworth" OR "Peter Attia"' }
+];
+
+// Optional: YouTube channel IDs (start with "UC...") for real video links. Leave empty to skip.
+// Find an ID: channel page -> About -> Share channel -> Copy channel ID.
+const YOUTUBE_CHANNEL_IDS = [];
+
+const SYSTEM_INSTRUCTION = `You are a Personal Polymath AI Coach, News Curator, and Cognitive Trainer for a learner based in Bengaluru, India.
+
+FORMAT: Output plain text for Telegram. No markdown headers (#), no tables, no asterisk bold. Use short CAPS headings, a few emojis, and simple numbers or dashes for lists.
+
+GROUNDING: You have NO live web access. Discuss only news, videos, posts and links that are explicitly provided in the conversation. Cite a provided item only by its token, e.g. [L7], exactly as given. Never invent URLs, quotes, tweets, statistics or sources. If something was not provided, say so briefly instead of guessing.
+
+COACHING: When the user replies to a quiz, puzzle, debate, journal prompt or speech draft from earlier in the conversation, evaluate it thoroughly: reveal correct answers (if you cannot verify an answer from the provided material, say so), give specific constructive feedback, then continue the dialogue. For speech analysis you receive a transcript plus measured metrics; you cannot hear tone, so never claim to judge voice quality or intonation.`;
+
+/* ------------------------------------------------------------------ */
+/* 1. MORNING BRIEFING & MIND-BODY PROTOCOL (daily, 7:30 AM IST)       */
+/* ------------------------------------------------------------------ */
+function sendMorningBriefing() {
+  runSafely_('Morning briefing', function () {
+    const today = Utilities.formatDate(new Date(), CONFIG.TIMEZONE, 'EEEE, MMMM d, yyyy');
+    const news = collectNews_();
+
+    // Part 1: digest, grounded in fetched headlines
+    const digestRaw = callGroq_([{
+      role: 'user',
+      content:
+        'Today is ' + today + '. Below are fresh headlines (format: ID | title (source)).\n' +
+        'Write my Daily Morning Digest using ONLY these items.\n' +
+        '- One section per topic label that has items. Pick the 2-3 most significant stories per section, ' +
+        'each as 1-2 cautious sentences (you only see headlines, so do not add details they do not state), ' +
+        'followed by its ID in square brackets, e.g. [L12].\n' +
+        '- For the VOICES sections and any VIDEO items, say who is in the news or what the video is, and add the ID.\n' +
+        '- Finish with BIG PICTURE: 3 bullets connecting the dots across sections.\n\n' +
+        news.text
+    }], { temperature: 0.4, maxTokens: 2600 });
+    const digestPlain = stripLinkTokens_(digestRaw);
+    sendTelegramMessage_('☀️ MORNING DIGEST — ' + today + '\n\n' + resolveLinks_(digestRaw, news.links));
+
+    // Part 2: active-recall quiz built from the digest
+    Utilities.sleep(CONFIG.PAUSE_MS);
+    const quiz = callGroq_([{
+      role: 'user',
+      content:
+        'Based ONLY on this digest, write 5 questions: 2 comprehension, 2 synthesis (connect two different stories), ' +
+        '1 prediction / critical-thinking. Number them 1-5. Do NOT include answers. ' +
+        'End with: "Reply with all your answers in one message and I will grade them."\n\nDIGEST:\n' + digestPlain
+    }], { temperature: 0.6, maxTokens: 900 });
+    sendTelegramMessage_('🧠 ACTIVE RECALL QUIZ\n\n' + quiz);
+    appendHistory_('assistant',
+      'MORNING DIGEST (for grading):\n' + digestPlain.slice(0, 2500) + '\n\nQUIZ I ASKED:\n' + quiz);
+
+    // Part 3: daily optimisation protocol
+    Utilities.sleep(CONFIG.PAUSE_MS);
+    const protocol = callGroq_([{
+      role: 'user',
+      content:
+        'Today is ' + today + '. Design my Daily Optimization Protocol: ' +
+        '1) brain-boosting diet for the day (South Indian / Bengaluru friendly, with specific meals), ' +
+        '2) a 25-minute exercise routine, 3) a 10-minute meditation & mindfulness protocol, ' +
+        '4) one creative thinking task, 5) one cognitive brain-sharpening drill. Keep it practical and time-boxed.'
+    }], { temperature: 0.7, maxTokens: 1500 });
+    sendTelegramMessage_('🌿 TODAY\'S MIND-BODY PROTOCOL\n\n' + protocol);
+  });
+}
+
+/* ------------------------------------------------------------------ */
+/* 2. 30-MINUTE FOCUS SWITCH & 15-MIN BRAIN BREAK                      */
+/*    (trigger every 30 min; active 10:00 AM - 9:30 PM IST)            */
+/* ------------------------------------------------------------------ */
+function sendThirtyMinuteBrainBreak() {
+  const now = new Date();
+  const hour = parseInt(Utilities.formatDate(now, CONFIG.TIMEZONE, 'HH'), 10);
+  const minute = parseInt(Utilities.formatDate(now, CONFIG.TIMEZONE, 'mm'), 10);
+  if (hour < 10 || hour > 21 || (hour === 21 && minute > 35)) return;
+
+  runSafely_('Brain break', function () {
+    const modes = [
+      'Mental Arithmetic & Fermi Estimation Sprint (5 escalating mental math problems)',
+      'Divergent Creativity & Lateral Thinking Challenge (unusual uses or counterfactual synthesis)',
+      'Improvisational Storytelling Sprint (give me 3 random constraints to craft a 5-sentence story)',
+      'Rapid Devil\'s Advocate Debate (pitch a bold thesis and challenge me to refute it in 4 sentences)',
+      'Book Recommendation & Mental Model Micro-Dive (1 high-impact book + a 5-minute exercise)',
+      'Logic, Spatial Visualization & Game-Theory Puzzle (1 brain teaser; wait for my answer)'
+    ];
+    const slotIndex = ((hour - 10) * 2 + (minute >= 30 ? 1 : 0)) % modes.length;
+    const timeStr = Utilities.formatDate(now, CONFIG.TIMEZONE, 'hh:mm a');
+
+    const text = callGroq_([{
+      role: 'user',
+      content:
+        '30-Minute Focus Switch (' + timeStr + ' IST): time for a 15-minute whole-brain break!\n' +
+        'Current rotation mode: ' + modes[slotIndex] + '.\n' +
+        'Generate a fresh, engaging 15-minute interactive exercise for this mode right now, so I shift from work mode ' +
+        'to activating another region of my brain. Keep it under 250 words, and end by telling me exactly what to reply with.'
+    }], { temperature: 0.9, maxTokens: 700 });
+
+    sendTelegramMessage_('⏰ FOCUS SWITCH — ' + timeStr + ' IST\n\n' + text);
+    appendHistory_('assistant', text);
+  });
+}
+
+/* ------------------------------------------------------------------ */
+/* 3. 10:00 PM JOURNAL, SPEECH TASK & INVENTION MASTERCLASS            */
+/* ------------------------------------------------------------------ */
+function sendEveningCoach() {
+  runSafely_('Evening coach', function () {
+    const part1 = callGroq_([{
+      role: 'user',
+      content:
+        'It is 10:00 PM IST. Run my Evening Wind-Down & Speech Lab:\n' +
+        '1) JOURNAL: ask me 3 concise evening reflection questions.\n' +
+        '2) 2-MINUTE SPEECH TASK: a thought-provoking topic and 3 rhetorical goals. Tell me to reply with a Telegram ' +
+        'voice note (or text) so you can analyze structure, pacing, filler words, vocabulary and persuasion.\n' +
+        '3) EVENING CONVERSATION STARTER: 1 deep Socratic question to discuss tonight.'
+    }], { temperature: 0.8, maxTokens: 900 });
+    sendTelegramMessage_('🌙 EVENING WIND-DOWN\n\n' + part1);
+    appendHistory_('assistant', part1);
+
+    Utilities.sleep(CONFIG.PAUSE_MS);
+    const invention = pickInvention_();
+    const lesson = callGroq_([{
+      role: 'user',
+      content:
+        'Invention Masterclass on: ' + invention + '.\n' +
+        'Teach me (about 500 words): 1) the human story behind it, 2) the first-principles mechanism explained simply, ' +
+        '3) its societal impact, 4) one surprising fact, 5) one question to ponder. ' +
+        'If you are unsure of a date or name, say so rather than guessing.'
+    }], { temperature: 0.6, maxTokens: 1400 });
+    sendTelegramMessage_('💡 INVENTION MASTERCLASS: ' + invention.toUpperCase() + '\n\n' + lesson);
+    appendHistory_('assistant', lesson);
+  });
+}
+
+/** Picks an invention not covered before (history kept in Script Properties). */
+function pickInvention_() {
+  const props = PropertiesService.getScriptProperties();
+  let seen = [];
+  try { seen = JSON.parse(props.getProperty('SEEN_INVENTIONS') || '[]'); } catch (e) { seen = []; }
+  const raw = callGroq_([{
+    role: 'user',
+    content:
+      'Name ONE fascinating invention (historical or modern, from any culture, India included) that would make a ' +
+      'great 10-minute lesson. Do NOT pick any of these: ' + (seen.slice(-60).join('; ') || 'none') + '. ' +
+      'Reply with only the invention\'s name, nothing else.'
+  }], { temperature: 1.0, maxTokens: 30 });
+  const name = raw.split('\n')[0].replace(/["*.]/g, '').trim() || 'The printing press';
+  seen.push(name);
+  props.setProperty('SEEN_INVENTIONS', JSON.stringify(seen.slice(-120)));
+  return name;
+}
+
+/* ------------------------------------------------------------------ */
+/* 4. TELEGRAM WEBHOOK: quiz answers, chat, voice-note speech analysis */
+/* ------------------------------------------------------------------ */
+function doPost(e) {
+  const ok = ContentService.createTextOutput('ok');
+  try {
+    const update = JSON.parse(e.postData.contents);
+    const msg = update.message;
+    if (!msg) return ok;
+    if (String(msg.chat.id) !== String(getSecret_('TELEGRAM_CHAT_ID'))) return ok;
+
+    // Telegram may re-deliver an update if it does not get a clean 200 in time: ignore repeats.
+    const cache = CacheService.getScriptCache();
+    const dedupeKey = 'upd_' + update.update_id;
+    if (cache.get(dedupeKey)) return ok;
+    cache.put(dedupeKey, '1', 21600);
+
+    if (msg.voice) {
+      sendTelegramMessage_(handleVoice_(msg.voice));
+    } else if (msg.text) {
+      sendTelegramMessage_(handleText_(msg.text));
+    }
+  } catch (err) {
+    console.error('Webhook error: ' + err);
+    try { sendTelegramMessage_('⚠️ Something went wrong: ' + String(err.message || err).slice(0, 300)); } catch (ignore) {}
+  }
+  return ok;
+}
+
+function handleText_(userText) {
+  const messages = loadHistory_().concat([{ role: 'user', content: userText }]);
+  const reply = callGroq_(messages, { temperature: 0.7 });
+  saveHistory_(messages.concat([{ role: 'assistant', content: reply }]));
+  return reply;
+}
+
+function handleVoice_(voice) {
+  const blob = downloadTelegramFile_(voice.file_id).setName('voice.ogg').setContentType('audio/ogg');
+  const stt = transcribe_(blob);
+  if (!stt.text) return 'I could not hear any speech in that voice note. Try again a little closer to the mic.';
+
+  const durationSec = stt.duration || voice.duration || 0;
+  const wordCount = (stt.text.match(/[A-Za-z0-9\u00C0-\u024F\u0900-\u0DFF']+/g) || []).length;
+  const wpm = durationSec > 0 ? Math.round(wordCount / (durationSec / 60)) : null;
+  const fillers = countFillers_(stt.text);
+  const fillerSummary = Object.keys(fillers.counts).map(function (k) { return k + ' x' + fillers.counts[k]; }).join(', ') || 'none detected';
+
+  const prompt =
+    'Analyze my practice speech from the transcript and measured metrics below.\n' +
+    'METRICS: duration ' + Math.round(durationSec) + 's, ' + wordCount + ' words, ' +
+    (wpm ? wpm + ' words/min (conversational ideal is roughly 130-160)' : 'pace unknown') +
+    '; filler words (regex count, approximate; "like" may be legitimate use, and the transcriber can omit some fillers): ' +
+    fillers.total + ' [' + fillerSummary + '].\n\n' +
+    'TRANSCRIPT:\n' + stt.text + '\n\n' +
+    'Give me: 1) a 2-line summary of what I argued, 2) scores out of 10 with one-line reasons for Argument Structure, ' +
+    'Pacing (use the WPM), Filler Words, Vocabulary and Rhetorical Impact, 3) three concrete improvements, ' +
+    '4) a high-impact rewrite of my core paragraph. Do not comment on tone of voice, since you only have text.';
+
+  const messages = loadHistory_().concat([{ role: 'user', content: prompt }]);
+  const reply = callGroq_(messages, { temperature: 0.5, maxTokens: 1800 });
+  saveHistory_(messages.concat([{ role: 'assistant', content: reply }]));
+  return '🎙️ SPEECH ANALYSIS\n\n' + reply;
+}
+
+/** Heuristic filler-word counter. */
+function countFillers_(text) {
+  const re = /\b(um+|uh+|er+m?|ah+|hmm+|you know|i mean|kind of|sort of|basically|actually|literally|like)\b/gi;
+  const counts = {};
+  let total = 0;
+  let m;
+  while ((m = re.exec(text)) !== null) {
+    const k = m[1].toLowerCase();
+    counts[k] = (counts[k] || 0) + 1;
+    total++;
+  }
+  return { total: total, counts: counts };
+}
+
+/* ------------------------------------------------------------------ */
+/* GROQ HELPERS                                                        */
+/* ------------------------------------------------------------------ */
+
+/**
+ * Chat completion with retry + automatic model fallback.
+ * @param {Array<{role:string,content:string}>} messages  conversation (system prompt is added here)
+ * @param {{temperature?:number,maxTokens?:number}} opts
+ * @return {string} assistant text (throws if every model fails)
+ */
+function callGroq_(messages, opts) {
+  opts = opts || {};
+  const key = getSecret_('GROQ_API_KEY');
+  const models = [CONFIG.MODEL, CONFIG.FALLBACK_MODEL];
+  // GPT-OSS models "think" before answering. Those reasoning tokens count toward the completion limit,
+  // so we add headroom; otherwise short calls (e.g. 30 tokens) would be eaten by reasoning and return nothing.
+  const body = function (model, withReasoningParams) {
+    const reasoning = isReasoningModel_(model);
+    const payload = {
+      model: model,
+      messages: [{ role: 'system', content: SYSTEM_INSTRUCTION }].concat(messages),
+      temperature: opts.temperature !== undefined ? opts.temperature : CONFIG.TEMPERATURE,
+      max_completion_tokens: (opts.maxTokens || CONFIG.MAX_TOKENS) + (reasoning ? CONFIG.REASONING_BUFFER : 0)
+    };
+    if (reasoning && withReasoningParams) {
+      payload.reasoning_effort = CONFIG.REASONING_EFFORT;
+      payload.include_reasoning = false;   // keep chain-of-thought out of the reply
+    }
+    return JSON.stringify(payload);
+  };
+  let lastError = '';
+
+  for (let m = 0; m < models.length; m++) {
+    let withReasoningParams = true;   // dropped automatically if the API rejects them (HTTP 400)
+    for (let attempt = 0; attempt < 3; attempt++) {
+      const res = UrlFetchApp.fetch(CONFIG.GROQ_BASE + '/chat/completions', {
+        method: 'post',
+        contentType: 'application/json',
+        headers: { Authorization: 'Bearer ' + key },
+        payload: body(models[m], withReasoningParams),
+        muteHttpExceptions: true
+      });
+      const code = res.getResponseCode();
+      const content = res.getContentText();
+
+      if (code === 200) {
+        let text = '';
+        try { text = (JSON.parse(content).choices[0].message.content || '').trim(); } catch (ignore) {}
+        if (text) return text;
+        lastError = models[m] + ': empty response (try raising CONFIG.REASONING_BUFFER)';
+        break;
+      }
+
+      lastError = models[m] + ' -> HTTP ' + code + ': ' + content.slice(0, 200);
+      console.log(lastError);
+      if (code === 400 && withReasoningParams && isReasoningModel_(models[m])) {
+        withReasoningParams = false;   // retry once without reasoning_effort / include_reasoning
+        continue;
+      }
+      if (attempt < 2 && code === 429) {
+        const wait = retryAfterSeconds_(res) || 5;
+        if (wait <= 25) { Utilities.sleep(wait * 1000); continue; }
+      } else if (attempt < 2 && code >= 500) {
+        Utilities.sleep(2000);
+        continue;
+      }
+      break;   // 404 (model not available to you), auth errors, etc. -> try the next model
+    }
+  }
+  throw new Error('Groq unavailable. Last error: ' + lastError);
+}
+
+function isReasoningModel_(model) {
+  return /gpt-oss/i.test(model);
+}
+
+/** Run from the editor: logs the model IDs your Groq key can actually use (copy one into CONFIG.MODEL). */
+function listGroqModels() {
+  const res = UrlFetchApp.fetch(CONFIG.GROQ_BASE + '/models', {
+    headers: { Authorization: 'Bearer ' + getSecret_('GROQ_API_KEY') },
+    muteHttpExceptions: true
+  });
+  if (res.getResponseCode() !== 200) {
+    console.log('HTTP ' + res.getResponseCode() + ': ' + res.getContentText().slice(0, 300));
+    return;
+  }
+  const ids = JSON.parse(res.getContentText()).data.map(function (x) { return x.id; }).sort();
+  console.log('Available models:\n' + ids.join('\n'));
+}
+
+function retryAfterSeconds_(res) {
+  const headers = res.getAllHeaders ? res.getAllHeaders() : {};
+  for (const k in headers) {
+    if (k.toLowerCase() === 'retry-after') return Math.ceil(Number(headers[k])) || 0;
+  }
+  return 0;
+}
+
+/** Groq Whisper transcription (verbose_json gives us the audio duration). */
+function transcribe_(blob) {
+  const res = UrlFetchApp.fetch(CONFIG.GROQ_BASE + '/audio/transcriptions', {
+    method: 'post',
+    headers: { Authorization: 'Bearer ' + getSecret_('GROQ_API_KEY') },
+    payload: {
+      file: blob,
+      model: CONFIG.STT_MODEL,
+      response_format: 'verbose_json',
+      temperature: '0',
+      // Style prompt nudges Whisper to keep disfluencies instead of cleaning them up.
+      prompt: 'Umm, let me think, like, hmm... okay, so, you know, I mean, basically, uh, here is what I think.'
+    },
+    muteHttpExceptions: true
+  });
+  if (res.getResponseCode() !== 200) {
+    throw new Error('Whisper HTTP ' + res.getResponseCode() + ': ' + res.getContentText().slice(0, 200));
+  }
+  const data = JSON.parse(res.getContentText());
+  return { text: (data.text || '').trim(), duration: data.duration };
+}
+
+/* ------------------------------------------------------------------ */
+/* NEWS GROUNDING (free RSS)                                           */
+/* ------------------------------------------------------------------ */
+
+/**
+ * Fetches headlines in parallel. Each item gets a short ID (L1, L2...) so the model never has to
+ * copy long URLs; resolveLinks_() swaps the IDs for real links after generation.
+ */
+function collectNews_() {
+  const requests = NEWS_TOPICS.map(function (t) {
+    return { url: googleNewsUrl_(t.query), muteHttpExceptions: true };
+  });
+  YOUTUBE_CHANNEL_IDS.forEach(function (id) {
+    requests.push({ url: 'https://www.youtube.com/feeds/videos.xml?channel_id=' + id, muteHttpExceptions: true });
+  });
+  const responses = UrlFetchApp.fetchAll(requests);
+
+  const links = {};
+  const seen = {};
+  const blocks = [];
+  const videoLines = [];
+  let n = 0;
+
+  const addItem = function (item) {
+    const k = item.title.toLowerCase();
+    if (!item.title || !item.link || seen[k]) return null;
+    seen[k] = true;
+    const id = 'L' + (++n);
+    links[id] = item.link;
+    return id + ' | ' + item.title.slice(0, 140) + (item.source ? ' (' + item.source + ')' : '');
+  };
+
+  NEWS_TOPICS.forEach(function (topic, i) {
+    const lines = [];
+    parseGoogleNews_(responses[i]).forEach(function (item) {
+      if (lines.length >= CONFIG.HEADLINES_PER_TOPIC) return;
+      const line = addItem(item);
+      if (line) lines.push(line);
+    });
+    if (lines.length) blocks.push('## ' + topic.label + '\n' + lines.join('\n'));
+  });
+
+  for (let j = NEWS_TOPICS.length; j < responses.length; j++) {
+    parseYouTube_(responses[j]).slice(0, 2).forEach(function (item) {
+      const line = addItem(item);
+      if (line) videoLines.push(line);
+    });
+  }
+  if (videoLines.length) blocks.push('## VIDEOS (recent uploads)\n' + videoLines.join('\n'));
+
+  if (!n) throw new Error('No news could be fetched from the RSS feeds.');
+  return { text: blocks.join('\n\n'), links: links };
+}
+
+function googleNewsUrl_(query) {
+  return 'https://news.google.com/rss/search?q=' + encodeURIComponent(query + ' when:1d') +
+    '&hl=en-IN&gl=IN&ceid=IN:en';
+}
+
+function parseGoogleNews_(res) {
+  if (!res || res.getResponseCode() !== 200) return [];
+  try {
+    const channel = XmlService.parse(res.getContentText()).getRootElement().getChild('channel');
+    return channel.getChildren('item').map(function (it) {
+      const srcEl = it.getChild('source');
+      const source = srcEl ? srcEl.getText() : '';
+      let title = it.getChildText('title') || '';
+      if (source && title.slice(-(source.length + 3)) === ' - ' + source) {
+        title = title.slice(0, -(source.length + 3));
+      }
+      return { title: title, link: it.getChildText('link') || '', source: source };
+    });
+  } catch (err) {
+    return [];
+  }
+}
+
+function parseYouTube_(res) {
+  if (!res || res.getResponseCode() !== 200) return [];
+  try {
+    const atom = XmlService.getNamespace('http://www.w3.org/2005/Atom');
+    const root = XmlService.parse(res.getContentText()).getRootElement();
+    const channelName = root.getChildText('title', atom) || 'YouTube';
+    const cutoff = Date.now() - 7 * 24 * 3600 * 1000;
+    return root.getChildren('entry', atom).filter(function (e) {
+      const published = Date.parse(e.getChildText('published', atom) || '');
+      return !published || published >= cutoff;
+    }).map(function (e) {
+      const linkEl = e.getChild('link', atom);
+      return {
+        title: e.getChildText('title', atom) || '',
+        link: linkEl ? linkEl.getAttribute('href').getValue() : '',
+        source: channelName + ' (YouTube)'
+      };
+    });
+  } catch (err) {
+    return [];
+  }
+}
+
+/** Replaces [L7] or [L7, L9] with the real URL(s). */
+function resolveLinks_(text, links) {
+  return text.replace(/\[(L\d+(?:\s*[,;]\s*L\d+)*)\]/g, function (m, group) {
+    return group.split(/\s*[,;]\s*/).map(function (id) { return links[id] || ''; })
+      .filter(Boolean).join(' ');
+  });
+}
+
+function stripLinkTokens_(text) {
+  return text.replace(/\s*\[L\d+(?:\s*[,;]\s*L\d+)*\]/g, '');
+}
+
+/* ------------------------------------------------------------------ */
+/* CHAT MEMORY (CacheService, so quiz answers can be graded)           */
+/* ------------------------------------------------------------------ */
+function loadHistory_() {
+  try {
+    return JSON.parse(CacheService.getScriptCache().get('chat_history') || '[]');
+  } catch (e) {
+    return [];
+  }
+}
+
+function saveHistory_(history) {
+  const h = history.map(function (m) {
+    return { role: m.role, content: String(m.content).slice(0, CONFIG.HISTORY_CHARS) };
+  });
+  while (h.length > CONFIG.HISTORY_MESSAGES) h.shift();
+  while (h.length > 1 && JSON.stringify(h).length > CONFIG.HISTORY_TOTAL_CHARS) h.shift();
+  CacheService.getScriptCache().put('chat_history', JSON.stringify(h), 21600);
+}
+
+function appendHistory_(role, content) {
+  const h = loadHistory_();
+  h.push({ role: role, content: content });
+  saveHistory_(h);
+}
+
+/* ------------------------------------------------------------------ */
+/* TELEGRAM HELPERS                                                    */
+/* ------------------------------------------------------------------ */
+function sendTelegramMessage_(text) {
+  const url = 'https://api.telegram.org/bot' + getSecret_('TELEGRAM_BOT_TOKEN') + '/sendMessage';
+  const chunks = splitMessage_(text, 3900);
+  chunks.forEach(function (chunk, i) {
+    if (i > 0) Utilities.sleep(500);
+    UrlFetchApp.fetch(url, {
+      method: 'post',
+      contentType: 'application/json',
+      payload: JSON.stringify({
+        chat_id: getSecret_('TELEGRAM_CHAT_ID'),
+        text: chunk,
+        link_preview_options: { is_disabled: true }
+      }),
+      muteHttpExceptions: true
+    });
+  });
+}
+
+/** Splits on paragraph / line / word boundaries instead of mid-sentence. */
+function splitMessage_(text, max) {
+  const chunks = [];
+  let rest = String(text).trim();
+  while (rest.length > max) {
+    let cut = rest.lastIndexOf('\n\n', max);
+    if (cut < max * 0.5) cut = rest.lastIndexOf('\n', max);
+    if (cut < max * 0.5) cut = rest.lastIndexOf(' ', max);
+    if (cut < 1) cut = max;
+    chunks.push(rest.slice(0, cut).trim());
+    rest = rest.slice(cut).trim();
+  }
+  if (rest) chunks.push(rest);
+  return chunks;
+}
+
+function downloadTelegramFile_(fileId) {
+  const token = getSecret_('TELEGRAM_BOT_TOKEN');
+  const info = JSON.parse(UrlFetchApp.fetch(
+    'https://api.telegram.org/bot' + token + '/getFile?file_id=' + encodeURIComponent(fileId)).getContentText());
+  if (!info.ok) throw new Error('Telegram getFile failed');
+  return UrlFetchApp.fetch('https://api.telegram.org/file/bot' + token + '/' + info.result.file_path).getBlob();
+}
+
+/* ------------------------------------------------------------------ */
+/* UTILITIES & SETUP                                                   */
+/* ------------------------------------------------------------------ */
+function getSecret_(key) {
+  const value = PropertiesService.getScriptProperties().getProperty(key);
+  if (!value) throw new Error('Missing Script Property: ' + key);
+  return value;
+}
+
+function runSafely_(label, fn) {
+  try {
+    fn();
+  } catch (err) {
+    console.error(label + ' failed: ' + err);
+    try { sendTelegramMessage_('⚠️ ' + label + ' failed: ' + String(err.message || err).slice(0, 300)); } catch (ignore) {}
+  }
+}
+
+/** Run once from the editor: checks Groq + Telegram are wired up. */
+function testSetup() {
+  const reply = callGroq_([{ role: 'user', content: 'Reply with one short, upbeat sentence confirming you are online.' }], { maxTokens: 60 });
+  sendTelegramMessage_('✅ Setup OK (' + CONFIG.MODEL + '): ' + reply);
+}
+
+/** Run once after deploying the web app and saving WEBAPP_URL in Script Properties. */
+function setTelegramWebhook() {
+  const url = PropertiesService.getScriptProperties().getProperty('WEBAPP_URL') || ScriptApp.getService().getUrl();
+  if (!url) throw new Error('Set the WEBAPP_URL Script Property to your web app /exec URL first.');
+  const res = UrlFetchApp.fetch('https://api.telegram.org/bot' + getSecret_('TELEGRAM_BOT_TOKEN') + '/setWebhook', {
+    method: 'post',
+    contentType: 'application/json',
+    payload: JSON.stringify({ url: url, allowed_updates: ['message'], drop_pending_updates: true }),
+    muteHttpExceptions: true
+  });
+  console.log(res.getContentText());
+}
+
+/** ONE-CLICK SCHEDULE INSTALLER */
+function setupDailyTriggers() {
+  ScriptApp.getProjectTriggers().forEach(function (t) { ScriptApp.deleteTrigger(t); });
+
+  ScriptApp.newTrigger('sendMorningBriefing')
+    .timeBased().everyDays(1).atHour(7).nearMinute(30).inTimezone(CONFIG.TIMEZONE).create();
+
+  ScriptApp.newTrigger('sendThirtyMinuteBrainBreak')
+    .timeBased().everyMinutes(30).create();
+
+  ScriptApp.newTrigger('sendEveningCoach')
+    .timeBased().everyDays(1).atHour(22).nearMinute(0).inTimezone(CONFIG.TIMEZONE).create();
+}
